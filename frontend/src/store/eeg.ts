@@ -1,7 +1,9 @@
 import { create } from 'zustand';
-import { EEGData, BandPower, BrainState, CorrelationData, Recording, RecordingFrame, PlaybackState } from '../types';
+import { EEGData, BandPower, BrainState, CorrelationData, Recording, RecordingFrame, PlaybackState, RefreshInfo } from '../types';
+import { ALL_CHANNELS } from '../constants/channels';
 
 const STORAGE_KEY = 'eeg_recordings';
+const UI_STORAGE_KEY = 'eeg_ui_state';
 
 const loadRecordings = (): Recording[] => {
   try {
@@ -18,9 +20,48 @@ const saveRecordings = (recordings: Recording[]) => {
   } catch {}
 };
 
+type ActiveView = 'waveform' | 'diagnostics';
+
+interface UIState {
+  selectedChannel: string;
+  activeView: ActiveView;
+}
+
+const loadUIState = (): UIState => {
+  const fallback: UIState = { selectedChannel: 'Fp1', activeView: 'waveform' };
+  try {
+    const stored = localStorage.getItem(UI_STORAGE_KEY);
+    if (!stored) return fallback;
+    const parsed = JSON.parse(stored);
+    return {
+      selectedChannel: ALL_CHANNELS.includes(parsed.selectedChannel) ? parsed.selectedChannel : fallback.selectedChannel,
+      activeView: parsed.activeView === 'diagnostics' ? 'diagnostics' : 'waveform',
+    };
+  } catch {
+    return fallback;
+  }
+};
+
+const saveUIState = (state: UIState) => {
+  try {
+    localStorage.setItem(UI_STORAGE_KEY, JSON.stringify(state));
+  } catch {}
+};
+
+const idleRefreshInfo: RefreshInfo = {
+  status: 'idle',
+  source: null,
+  channel: null,
+  lastSuccessAt: null,
+  lastErrorAt: null,
+  lastErrorMessage: null,
+};
+
 interface EEGState {
   eegData: EEGData | null;
   selectedChannel: string;
+  /** 当前 eegData 实际对应的通道，用于通道切换后识别过期结果 */
+  dataChannel: string | null;
   bandPower: BandPower | null;
   isStreaming: boolean;
   brainState: BrainState | null;
@@ -32,12 +73,24 @@ interface EEGState {
   playbackMode: boolean;
   activeRecording: Recording | null;
   playbackState: PlaybackState;
+  /** 当前主面板视图：波形 / 信号质量诊断，返回或重进时保持选择 */
+  activeView: ActiveView;
+  /** 波形与诊断共享的最近一次刷新结果 */
+  refreshInfo: RefreshInfo;
+  /** 离线模拟模式：接口不可用时由用户显式开启 */
+  simulationMode: boolean;
+  /** 用于触发立即重新刷新（通道切换 / 手动重试时自增） */
+  refreshNonce: number;
   setEEGData: (d: EEGData | null) => void;
   setChannel: (c: string) => void;
   setBandPower: (b: BandPower | null) => void;
   setStreaming: (v: boolean) => void;
   setBrainState: (s: BrainState | null) => void;
   setCorrelationData: (c: CorrelationData | null) => void;
+  setActiveView: (v: ActiveView) => void;
+  setRefreshInfo: (info: Partial<RefreshInfo>) => void;
+  setSimulationMode: (v: boolean) => void;
+  triggerRefresh: () => void;
   startRecording: () => void;
   stopRecording: (name: string) => void;
   addRecordingFrame: (eeg: EEGData, bands: BandPower, brainState: BrainState, correlation: CorrelationData) => void;
@@ -49,9 +102,12 @@ interface EEGState {
   setPlaybackPlaying: (playing: boolean) => void;
 }
 
+const initialUI = loadUIState();
+
 export const useEEGStore = create<EEGState>((set, get) => ({
   eegData: null,
-  selectedChannel: 'Fp1',
+  selectedChannel: initialUI.selectedChannel,
+  dataChannel: null,
   bandPower: null,
   isStreaming: false,
   brainState: null,
@@ -67,12 +123,46 @@ export const useEEGStore = create<EEGState>((set, get) => ({
     currentTime: 0,
     currentFrame: null,
   },
+  activeView: initialUI.activeView,
+  refreshInfo: idleRefreshInfo,
+  simulationMode: false,
+  refreshNonce: 0,
   setEEGData: (d) => set({ eegData: d }),
-  setChannel: (c) => set({ selectedChannel: c }),
+  setChannel: (c) => {
+    const { selectedChannel, playbackMode } = get();
+    if (c === selectedChannel) return;
+    set({
+      selectedChannel: c,
+      // 直播模式下切换通道：新数据到达前旧诊断结果标记为过期/加载中；
+      // 回放模式下继续展示历史帧数据，不标记为加载。
+      refreshInfo: playbackMode
+        ? { ...get().refreshInfo, channel: c }
+        : {
+            ...get().refreshInfo,
+            status: 'loading',
+            channel: c,
+            lastErrorMessage: null,
+          },
+    });
+    saveUIState({ selectedChannel: c, activeView: get().activeView });
+  },
   setBandPower: (b) => set({ bandPower: b }),
   setStreaming: (v) => set({ isStreaming: v }),
   setBrainState: (s) => set({ brainState: s }),
   setCorrelationData: (c) => set({ correlationData: c }),
+  setActiveView: (v) => {
+    set({ activeView: v });
+    saveUIState({ selectedChannel: get().selectedChannel, activeView: v });
+  },
+  setRefreshInfo: (info) => set({ refreshInfo: { ...get().refreshInfo, ...info } }),
+  setSimulationMode: (v) => set({ simulationMode: v }),
+  triggerRefresh: () => {
+    if (get().playbackMode) return;
+    set({
+      refreshNonce: get().refreshNonce + 1,
+      refreshInfo: { ...get().refreshInfo, status: 'loading', lastErrorMessage: null },
+    });
+  },
   startRecording: () => {
     const { selectedChannel } = get();
     set({
@@ -128,18 +218,28 @@ export const useEEGStore = create<EEGState>((set, get) => ({
   },
   enterPlaybackMode: (recording) => {
     if (recording.frames.length === 0) return;
+    const firstFrame = recording.frames[0];
     set({
       playbackMode: true,
       activeRecording: recording,
       playbackState: {
         isPlaying: false,
         currentTime: 0,
-        currentFrame: recording.frames[0],
+        currentFrame: firstFrame,
       },
-      eegData: recording.frames[0].eeg,
-      bandPower: recording.frames[0].bands,
-      brainState: recording.frames[0].brainState,
-      correlationData: recording.frames[0].correlation,
+      eegData: firstFrame.eeg,
+      dataChannel: recording.channel,
+      bandPower: firstFrame.bands,
+      brainState: firstFrame.brainState,
+      correlationData: firstFrame.correlation,
+      refreshInfo: {
+        status: 'success',
+        source: 'playback',
+        channel: recording.channel,
+        lastSuccessAt: Date.now(),
+        lastErrorAt: null,
+        lastErrorMessage: null,
+      },
     });
   },
   exitPlaybackMode: () => {
@@ -151,7 +251,13 @@ export const useEEGStore = create<EEGState>((set, get) => ({
         currentTime: 0,
         currentFrame: null,
       },
+      refreshInfo: {
+        ...get().refreshInfo,
+        status: 'loading',
+        source: null,
+      },
     });
+    get().triggerRefresh();
   },
   setPlaybackTime: (time) => {
     const { activeRecording } = get();
@@ -173,9 +279,18 @@ export const useEEGStore = create<EEGState>((set, get) => ({
         currentFrame: frame,
       },
       eegData: frame.eeg,
+      dataChannel: activeRecording.channel,
       bandPower: frame.bands,
       brainState: frame.brainState,
       correlationData: frame.correlation,
+      refreshInfo: {
+        status: 'success',
+        source: 'playback',
+        channel: activeRecording.channel,
+        lastSuccessAt: Date.now(),
+        lastErrorAt: null,
+        lastErrorMessage: null,
+      },
     });
   },
   togglePlayback: () => {
